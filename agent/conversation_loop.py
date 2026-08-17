@@ -6355,6 +6355,36 @@ def run_conversation(
                                 # limit. 600s covers all realistic provider reset
                                 # windows while still rejecting pathological values. (#26293)
                                 _retry_after = min(float(_ra_raw), 600)
+                                # Pool-aware cap (Adam, 2026-08-17). Upstream
+                                # raised this 120s -> 600s because retrying the
+                                # SAME account before its bucket reset re-tripped
+                                # the limit (#26293). That reasoning only holds
+                                # for a single credential. With a multi-account
+                                # pool, an external roll (anthropic_autofailover,
+                                # 120s tick) or recover_with_credential_pool()
+                                # moves the next attempt onto a DIFFERENT account,
+                                # so a 10-minute sleep is pure dead time — a
+                                # Discord thread sat in a 600s backoff loop while
+                                # five healthy accounts were available. Cap to
+                                # 20s whenever another pool entry can be
+                                # selected; fall back to upstream's 600s when the
+                                # pool is absent or genuinely has nowhere to go.
+                                # 20s (not 120s) because rotation needs TWO
+                                # consecutive 429s: recover_with_credential_pool()
+                                # retries the SAME credential on the first one
+                                # (has_retried_429) and only rotates on the
+                                # second. At upstream's 600s that is 20 minutes
+                                # before the pool is even consulted — which is
+                                # exactly the lockup observed: the Discord turn
+                                # never rotated at all, it just sat until the
+                                # stream was aborted. 20s makes both strikes
+                                # land in well under a minute.
+                                try:
+                                    _pool = getattr(agent, "_credential_pool", None)
+                                    if _pool is not None and _pool.select() is not None:
+                                        _retry_after = min(_retry_after, 20)
+                                except Exception:
+                                    pass
                             except (TypeError, ValueError):
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
