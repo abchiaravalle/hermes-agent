@@ -889,11 +889,17 @@ def classify_api_error(
             should_compress=False,
         )
 
-    # Anthropic long-context tier gate (429 "extra usage" + "long context")
+    # Anthropic long-context tier gate (429 + "long context").
+    # Anthropic has shipped two wordings for this gate:
+    #   legacy:        "Extra usage is required for long context requests."
+    #   current 08/26: "Usage credits are required for long context requests."
+    # Matching only the legacy phrase silently demoted this to a plain
+    # rate_limit, so the context was never reduced and every retry resent an
+    # identical oversized request until the retry budget ran out.
     if (
         status_code == 429
-        and "extra usage" in error_msg
         and "long context" in error_msg
+        and ("extra usage" in error_msg or "usage credits" in error_msg)
     ):
         return _result(
             FailoverReason.long_context_tier,

@@ -5837,6 +5837,22 @@ def run_conversation(
                         and "nonetype" in str(api_error).lower()
                         and "not iterable" in str(api_error).lower()
                     )
+                    # jiter (the Rust JSON parser used for streaming SSE
+                    # chunk decode) raises a bare ValueError — not
+                    # json.JSONDecodeError — on a corrupted/malformed
+                    # streamed chunk, e.g. "key must be a string at line 1
+                    # column 27". That's an upstream transport artifact
+                    # (same class as json.JSONDecodeError above), not a
+                    # local programming bug, and should retry instead of
+                    # aborting the turn. Confirmed 2026-07-06: Adam hit
+                    # this via "Streaming failed before delivery: key must
+                    # be a string..." -> immediate non-retryable abort with
+                    # no recovery, even though a retry would very likely
+                    # succeed (transient single-chunk corruption).
+                    and not (
+                        isinstance(api_error, ValueError)
+                        and "key must be a string" in str(api_error).lower()
+                    )
                 )
                 # ``FailoverReason.billing`` (HTTP 402) is NOT in this
                 # exclusion set.  By the time we reach this block:

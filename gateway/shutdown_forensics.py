@@ -226,17 +226,46 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
+    # Cross-platform diagnostic commands. The original script used
+    # Linux-only tools (GNU `ps auxf --sort=-pcpu`, `pstree`, `/proc/loadavg`,
+    # `dmesg`) which all silently no-op (2>/dev/null || true) on macOS,
+    # producing an empty-but-well-formed log with every section blank —
+    # exactly the failure mode that made 2026-07-07's gateway hang
+    # undiagnosable. macOS BSD `ps` lacks --sort and pstree isn't installed
+    # by default; substitute the closest native equivalents.
+    if sys.platform == "darwin":
+        ps_cmd = "ps -Ao pid,ppid,pcpu,pmem,etime,stat,comm -r 2>/dev/null | head -60"
+        pstree_cmd = (
+            f"(command -v pstree >/dev/null 2>&1 && pstree -p {os.getpid()} 2>/dev/null | head -40) || "
+            f"(_pgid=$(ps -o pgid= -p {os.getpid()} 2>/dev/null | tr -d ' '); "
+            f"ps -o pid,ppid,pgid,stat,comm -g \"$_pgid\" 2>/dev/null | head -40) || true"
+        )
+        loadavg_cmd = "sysctl -n vm.loadavg 2>/dev/null || uptime 2>/dev/null || true"
+        dmesg_cmd = (
+            "log show --last 3m --style compact "
+            "--predicate 'eventMessage contains \"Jetsam\" or eventMessage contains \"low memory\"' "
+            "2>/dev/null | tail -20 || true"
+        )
+    else:
+        ps_cmd = "ps auxf --sort=-pcpu 2>/dev/null | head -60"
+        pstree_cmd = f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true"
+        loadavg_cmd = "cat /proc/loadavg 2>/dev/null || true"
+        dmesg_cmd = (
+            "dmesg -T 2>/dev/null | tail -20 || "
+            "journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true"
+        )
+
     script = (
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
-        "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
-        "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
-        "echo '--- recent dmesg (oom/killed) ---'; "
-        "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
+        "echo '--- ps snapshot (top 60 by cpu) ---'; "
+        f"{ps_cmd}; "
+        "echo '--- process tree of self ---'; "
+        f"{pstree_cmd}; "
+        "echo '--- load average ---'; "
+        f"{loadavg_cmd}; "
+        "echo '--- recent oom/kill signals ---'; "
+        f"{dmesg_cmd}; "
         "echo '=== end ==='"
     )
 

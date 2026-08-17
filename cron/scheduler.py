@@ -512,6 +512,71 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+# Transient-failure suppression (Adam customization).
+# Anthropic/other providers periodically return self-healing blips — the most
+# common being "HTTP 200: Overloaded" (a 200 OK carrying an overload error in
+# the body), plus 429/503/529/timeouts/connection resets. For a RECURRING job
+# these recover on the very next tick, so surfacing a scary "⚠️ Cron job failed"
+# message in chat is pure noise. We suppress the chat delivery for an ISOLATED
+# transient failure, but escalate (deliver as normal) the moment the SAME job
+# fails on two consecutive runs — at that point it's no longer self-healing and
+# the user should know. Hard errors (skill missing, script bug, empty response,
+# bad config) are never suppressed.
+#
+# Escalation uses upstream's persisted ``failure_streak`` counter (set by
+# cron.jobs.mark_job_run, reset on any success). A streak >= 1 means the
+# PREVIOUS run already failed, so this is the second in a row — deliver it.
+#
+# Toggle via config.yaml:  cron.suppress_transient_failures: false
+_TRANSIENT_CRON_ERROR_MARKERS = (
+    "overloaded",
+    "http 200: overloaded",
+    "rate limit",
+    "rate_limit",
+    "rate-limited",
+    "too many requests",
+    "http 429",
+    "429",
+    "http 502",
+    "http 503",
+    "http 529",
+    "502 bad gateway",
+    "503 service",
+    "overloaded_error",
+    "service unavailable",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "connection error",
+    "temporarily unavailable",
+    "try again",
+    "econnreset",
+)
+
+
+def _is_transient_cron_error(error_text: Optional[str]) -> bool:
+    """Heuristic: is this cron failure a self-healing provider/network blip?
+
+    Matches overload (incl. Anthropic's HTTP-200-Overloaded quirk), rate
+    limits, 5xx, and transport timeouts. Conservative: anything unrecognized
+    is treated as a HARD error and delivered as normal.
+    """
+    if not error_text:
+        return False
+    low = str(error_text).lower()
+    return any(marker in low for marker in _TRANSIENT_CRON_ERROR_MARKERS)
+
+
+def _suppress_transient_cron_failures() -> bool:
+    """Whether to suppress isolated transient cron failures (default: True)."""
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("suppress_transient_failures", True))
+    except Exception:
+        return True
+
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
 # system prompt *instructs* the agent to emit "[SILENT]", and real agents often
@@ -6311,10 +6376,34 @@ def _run_one_job_body(
                         f"⚠️ Cron '{job.get('name') or job['id']}' skipped: "
                         f"{_drift_text}"
                     )
+            # Isolated transient provider/network blips (Anthropic's
+            # "HTTP 200: Overloaded", 429/5xx, timeouts) self-heal on the next
+            # tick, so suppress the chat noise for a ONE-OFF. Escalate normally
+            # once failure_streak >= 1 (i.e. the previous run failed too — this
+            # is the second consecutive failure). Hard errors are never
+            # suppressed. Toggle: cron.suppress_transient_failures.
+            suppress_failure_delivery = False
+            if (
+                not success
+                and _suppress_transient_cron_failures()
+                and _is_transient_cron_error(error)
+            ):
+                try:
+                    _prior_failures = int(job.get("failure_streak") or 0)
+                except (TypeError, ValueError):
+                    _prior_failures = 0
+                if _prior_failures < 1:
+                    suppress_failure_delivery = True
+                    logger.info(
+                        "Job '%s': suppressing isolated transient failure from chat "
+                        "(self-heals next tick) — %s",
+                        job["id"], (error or "").strip()[:160],
+                    )
+
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
-            should_deliver = bool(deliver_content.strip())
+            should_deliver = bool(deliver_content.strip()) and not suppress_failure_delivery
             if blocked_config_silent or drift_skip_silent:
                 should_deliver = False
             unresolved_origin = False
