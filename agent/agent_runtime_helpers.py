@@ -1068,6 +1068,36 @@ def recover_with_credential_pool(
             kwargs["failure_reason"] = _failure_reason
         return pool.mark_exhausted_and_rotate(**kwargs)
 
+    # Adopt an EXTERNAL mid-turn roll (Adam, 2026-08-17).
+    # ``agent._credential_pool`` is an in-memory snapshot taken when the turn
+    # started. anthropic_autofailover rewrites auth.json on its 120s tick, but
+    # that never reaches a turn already in flight — so a long agentic turn kept
+    # hammering the capped account and could only rotate via the two-strike
+    # path below (first 429 retries the SAME credential, only the second
+    # rotates). At upstream's 600s Retry-After that is ~20 minutes, which is
+    # exactly the observed lockup: the Discord turn never rotated at all, it
+    # just sat until the stream aborted.
+    # Re-read the pool from disk; if an external roll has already chosen a
+    # different credential, swap to it and retry immediately instead of
+    # burning strikes on an account we have already moved off.
+    try:
+        from agent.credential_pool import load_pool as _load_pool_from_disk
+
+        _disk_pool = _load_pool_from_disk(pool_provider or getattr(pool, "provider", ""))
+        _disk_entry = _disk_pool.select() if _disk_pool is not None else None
+        _cur_entry = pool.current()
+        _disk_id = getattr(_disk_entry, "id", None)
+        _cur_id = getattr(_cur_entry, "id", None)
+        if _disk_entry is not None and _disk_id and _disk_id != _cur_id:
+            agent._swap_credential(_disk_entry)
+            _ra().logger.info(
+                "Credential %s — adopted external roll mid-turn: %s -> %s",
+                status_code, _cur_id or "?", _disk_id,
+            )
+            return True, False
+    except Exception as _adopt_exc:  # never let this block real recovery
+        _ra().logger.debug("external-roll adoption skipped: %s", _adopt_exc)
+
     effective_reason = classified_reason
     if effective_reason is None:
         if status_code == 402:
