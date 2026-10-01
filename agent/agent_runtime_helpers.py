@@ -1080,23 +1080,66 @@ def recover_with_credential_pool(
     # Re-read the pool from disk; if an external roll has already chosen a
     # different credential, swap to it and retry immediately instead of
     # burning strikes on an account we have already moved off.
-    try:
-        from agent.credential_pool import load_pool as _load_pool_from_disk
+    #
+    # Hot-loop guard (2026-10-01, fulcrum + amplifi Slack bots wedged for an
+    # hour each, ~80 log lines/sec). Three bugs made this branch loop forever:
+    #   1. It fired for ANY error, including status_code=None crashes such as
+    #      "No module named 'unittest'" after a Homebrew Python upgrade.
+    #      Swapping accounts cannot fix those, so it retried at full speed.
+    #   2. It compared against pool.current(), which _swap_credential() never
+    #      updates, so after a swap the ids never matched and it adopted the
+    #      same pair again on every retry.
+    #   3. Adoption returns (True, False) without touching the retry budget,
+    #      so nothing ever stopped it.
+    # Now: only credential-shaped failures adopt, the compare uses the entry
+    # the agent is actually using, the in-memory pool cursor is synced, and
+    # each target is adopted at most twice per agent.
+    _credential_failure = (
+        status_code in (401, 402, 403, 429)
+        or classified_reason in (
+            FailoverReason.rate_limit,
+            FailoverReason.billing,
+            FailoverReason.auth,
+        )
+    )
+    if _credential_failure:
+        try:
+            from agent.credential_pool import load_pool as _load_pool_from_disk
 
-        _disk_pool = _load_pool_from_disk(pool_provider or getattr(pool, "provider", ""))
-        _disk_entry = _disk_pool.select() if _disk_pool is not None else None
-        _cur_entry = pool.current()
-        _disk_id = getattr(_disk_entry, "id", None)
-        _cur_id = getattr(_cur_entry, "id", None)
-        if _disk_entry is not None and _disk_id and _disk_id != _cur_id:
-            agent._swap_credential(_disk_entry)
-            _ra().logger.info(
-                "Credential %s — adopted external roll mid-turn: %s -> %s",
-                status_code, _cur_id or "?", _disk_id,
-            )
-            return True, False
-    except Exception as _adopt_exc:  # never let this block real recovery
-        _ra().logger.debug("external-roll adoption skipped: %s", _adopt_exc)
+            _disk_pool = _load_pool_from_disk(pool_provider or getattr(pool, "provider", ""))
+            _disk_entry = _disk_pool.select() if _disk_pool is not None else None
+            _disk_id = getattr(_disk_entry, "id", None)
+            _in_use_id = _credential_id or getattr(pool.current(), "id", None)
+            _adopt_counts = getattr(agent, "_external_roll_adopt_counts", None)
+            if not isinstance(_adopt_counts, dict):
+                _adopt_counts = {}
+                try:
+                    agent._external_roll_adopt_counts = _adopt_counts
+                except Exception:
+                    pass
+            if (
+                _disk_entry is not None
+                and _disk_id
+                and _disk_id != _in_use_id
+                and _adopt_counts.get(_disk_id, 0) < 2
+            ):
+                _adopt_counts[_disk_id] = _adopt_counts.get(_disk_id, 0) + 1
+                agent._swap_credential(_disk_entry)
+                # Keep the in-memory cursor in step with what the agent now
+                # uses, so the next failure attributes to the right entry.
+                try:
+                    with pool._lock:
+                        if any(e.id == _disk_id for e in pool._entries):
+                            pool._current_id = _disk_id
+                except Exception:
+                    pass
+                _ra().logger.info(
+                    "Credential %s — adopted external roll mid-turn: %s -> %s",
+                    status_code, _in_use_id or "?", _disk_id,
+                )
+                return True, False
+        except Exception as _adopt_exc:  # never let this block real recovery
+            _ra().logger.debug("external-roll adoption skipped: %s", _adopt_exc)
 
     effective_reason = classified_reason
     if effective_reason is None:
