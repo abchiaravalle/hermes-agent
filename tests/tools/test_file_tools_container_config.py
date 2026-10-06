@@ -54,6 +54,21 @@ class TestFileToolsContainerConfig:
         cc = self._run(_make_env_config(docker_mount_cwd_to_workspace=True), "t1").get("container_config", {})
         assert cc.get("docker_mount_cwd_to_workspace") is True
 
+    def test_file_tool_sandbox_matches_terminal_sandbox(self):
+        """A sandbox first created by a file tool must get the same container_config the terminal tool builds.
+
+        Regression: file_tools hand-built a subset that dropped docker_extra_args, so an operator's
+        ``--network=<firewalled net>`` was missing whenever read_file/search_files ran first. A fail-closed
+        sandbox entrypoint then refused to start and every later tool call saw "container is not running".
+        """
+        from tools.terminal_tool import _container_config_from_config
+        cfg = _make_env_config(docker_extra_args=["--network=locked-net", "--pids-limit=64"],
+                               docker_env={"A": "1"}, docker_shm_size="2g",
+                               docker_persist_across_processes=False)
+        cc = self._run(cfg, "t-net").get("container_config", {})
+        assert cc.get("docker_extra_args") == ["--network=locked-net", "--pids-limit=64"]
+        assert cc == _container_config_from_config(cfg)
+
 
     def test_cwd_only_raw_task_override_reaches_file_environment(self):
         """CWD-only task overrides collapse to default but must keep their cwd."""
