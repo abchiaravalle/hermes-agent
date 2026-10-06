@@ -101,6 +101,63 @@ class TestFilterMCPChildren:
 
         assert mcp_tool._filter_mcp_children({101, 102, 103}) == {103}
 
+    def test_filter_mcp_children_drops_unrelated_children_when_spawn_argv_known(self, monkeypatch):
+        """A cron script started in the same second must never be tracked as the MCP child."""
+        import sys
+        from types import SimpleNamespace
+
+        from tools import mcp_tool
+
+        spawn = ["/usr/bin/python3", "/h/tools/mcp_stdio_watchdog.py", "--ppid", "4242", "--", "/bin/bash", "/h/bin/notion-mcp.sh"]
+        cmdlines = {
+            201: ["/Library/Python.app/Contents/MacOS/Python", "/h/tools/mcp_stdio_watchdog.py", "--ppid", "4242", "--", "/bin/bash", "/h/bin/notion-mcp.sh"],
+            202: ["/Library/Python.app/Contents/MacOS/Python", "/h/scripts/norwest_attacker_watch.py"],
+            203: ["/bin/bash", "-c", "ls"],
+        }
+
+        class FakeProcess:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def cmdline(self):
+                return cmdlines[self.pid]
+
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(
+            Process=FakeProcess, NoSuchProcess=ProcessLookupError, AccessDenied=PermissionError,
+        ))
+
+        assert mcp_tool._filter_mcp_children({201, 202, 203}, expected_argv=spawn) == {201}
+        # Without the spawn argv the old behaviour is kept (back-compat for other callers).
+        assert mcp_tool._filter_mcp_children({201, 202, 203}) == {201, 202, 203}
+
+    def test_filter_mcp_children_real_processes(self):
+        """E2E with real children and real psutil: only the wrapped MCP spawn survives the filter."""
+        import os
+        import subprocess
+        import sys
+        import time
+
+        from tools import mcp_tool
+
+        cmd, args = mcp_tool._wrap_command_with_watchdog(sys.executable, ["-c", "import time; time.sleep(30)"])
+        before = mcp_tool._snapshot_child_pids()
+        mcp = subprocess.Popen([cmd, *args], stdin=subprocess.PIPE, start_new_session=True)
+        script = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)  # cron script"], start_new_session=True)
+        try:
+            time.sleep(1.0)
+            delta = mcp_tool._snapshot_child_pids() - before
+            assert {mcp.pid, script.pid} <= delta
+            kept = mcp_tool._filter_mcp_children(delta, expected_argv=[cmd, *args])
+            assert mcp.pid in kept
+            assert script.pid not in kept
+        finally:
+            for p in (mcp, script):
+                try:
+                    os.killpg(p.pid, 9)
+                except OSError:
+                    pass
+                p.wait(timeout=5)
+
 
 # ---------------------------------------------------------------------------
 # Config loading

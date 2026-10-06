@@ -3077,7 +3077,8 @@ class MCPServerTask:
                 # shutdown sweep's killpg() kills the TUI parent itself.
                 # See agent/lsp/client.py for the complementary start_new_session fix.
                 new_pids = _filter_mcp_children(
-                    _snapshot_child_pids() - pids_before
+                    _snapshot_child_pids() - pids_before,
+                    expected_argv=[command, *args],
                 )
                 if new_pids:
                     # Capture pgid while the child is alive — once it exits we
@@ -5142,7 +5143,27 @@ _NON_MCP_CHILD_CMDLINE_MARKERS: tuple[str, ...] = (
 )
 
 
-def _filter_mcp_children(pids: set) -> set:
+def _argv_matches_spawn(argv: list, expected_argv: list) -> bool:
+    """True when a live process's argv is the stdio command we just spawned.
+
+    ``argv[0]`` is not compared: interpreters and launchers rewrite it (macOS
+    Python.app, Homebrew symlinks, node process titles). The spawn's own
+    arguments are compared instead and must appear as one contiguous run. With
+    the parent-death watchdog wrapper those arguments include
+    ``mcp_stdio_watchdog.py --ppid <this pid>``, which no other child carries.
+    A spawn with no arguments falls back to matching the command's basename.
+    """
+    if not argv or not expected_argv:
+        return False
+    expected_args = [str(a) for a in expected_argv[1:]]
+    if expected_args:
+        n = len(expected_args)
+        return any(argv[i:i + n] == expected_args for i in range(len(argv) - n + 1))
+    want = os.path.basename(str(expected_argv[0]))
+    return any(os.path.basename(str(a)) == want for a in argv[:2])
+
+
+def _filter_mcp_children(pids: set, expected_argv: Optional[list] = None) -> set:
     """Remove non-MCP children from a PID snapshot delta.
 
     _snapshot_child_pids() returns *all* direct children of the gateway. When
@@ -5151,6 +5172,15 @@ def _filter_mcp_children(pids: set) -> set:
     PIDs that are NOT the MCP server. Tracking those PIDs in _stdio_pgids is
     catastrophic if a future child lacks start_new_session: its pgid can be the
     TUI parent's PID, so the shutdown sweep's killpg() kills the TUI itself.
+
+    Cron ``no_agent`` scripts are gateway children too. A script Popen'd in the
+    same second as a stdio MCP spawn landed in the delta, and when that MCP
+    connect then failed the script was marked an orphan and SIGTERMed by the
+    next ``_kill_orphaned_mcp_children`` sweep ("Script exited with code -15";
+    six different cron scripts killed this way, 2026-09-25..10-06). When the
+    caller passes ``expected_argv`` (the exact command + args handed to
+    ``stdio_client``), only processes whose argv carries that spawn's own
+    arguments are kept, so unrelated children can never be tracked or reaped.
     """
     if not pids:
         return pids
@@ -5172,6 +5202,10 @@ def _filter_mcp_children(pids: set) -> set:
             for arg in argv[1:]
             for marker in _NON_MCP_CHILD_CMDLINE_MARKERS
         ):
+            continue
+        if expected_argv is not None and not _argv_matches_spawn(argv, expected_argv):
+            # Some other gateway child (a cron script, a terminal command)
+            # that happened to start in the same window. Never ours to reap.
             continue
         filtered.add(pid)
     return filtered
