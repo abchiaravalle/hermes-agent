@@ -300,6 +300,23 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
+def is_live_subagent_session(session_id: str) -> bool:
+    """True when ``session_id`` belongs to a delegate_task child that is still running.
+
+    A child's session row carries its parent's chat routing, so a stray async
+    completion pinned to it must never wake a gateway turn: that would run a
+    second copy of the child alongside the live one (2026-10-19 incident).
+    """
+    if not session_id:
+        return False
+    with _active_subagents_lock:
+        for record in _active_subagents.values():
+            agent = record.get("agent")
+            if agent is not None and str(getattr(agent, "session_id", "") or "") == session_id:
+                return True
+    return False
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 

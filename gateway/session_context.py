@@ -505,6 +505,22 @@ def async_delivery_supported() -> bool:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
 
+    # A delegate_task child is finite too: it ends by returning its summary to
+    # the parent, and has no chat turn of its own to wake. Its inherited gateway
+    # routing (platform / chat / thread of the PARENT's conversation) made a
+    # child's background completion wake a brand-new gateway turn in the
+    # parent's chat; the async-delegation resolver then pinned that turn to the
+    # child's session id, so a SECOND copy of the child ran in parallel with the
+    # still-running original (same goal, same worktree; 2026-10-19). Children
+    # poll/wait instead.
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            return False
+    except Exception:
+        pass
+
     value = _SESSION_ASYNC_DELIVERY.get()
     if value is _UNSET:
         return True

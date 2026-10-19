@@ -107,6 +107,23 @@ _USER_BOUNDARY_END_REASONS = (
     "session_switch",
     "new_session",
 )
+
+
+def _is_delegated_child_session(row: Optional[dict], session_id: str) -> bool:
+    """True when ``session_id`` is a delegate_task child that is still running.
+
+    Children are persisted with the parent's chat routing (source/session_key),
+    so the session row cannot tell a child from a chat continuation (both carry
+    ``_delegate_from``). The in-process live-child registry is exact: a running
+    child is in it, everything else is not.
+    """
+    del row  # kept in the signature for callers that already hold the row
+    try:
+        from tools.delegate_tool import is_live_subagent_session
+
+        return is_live_subagent_session(session_id)
+    except Exception:
+        return False
 # Round-2 #2: upper bound on a single stall-notify adapter.send so a wedged
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
@@ -15572,6 +15589,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning(
                 "Async-delegation completion has unknown spawning session %s; "
                 "dropping injection (#55578 fail-closed).",
+                pinned_session_id,
+            )
+            return None
+
+        # A completion stamped with a delegate_task child's session id (the
+        # child spawned the process) must not wake a gateway turn: the child's
+        # row carries the parent's chat routing, and switching the chat's route
+        # to it ran a SECOND copy of the still-running child (2026-10-19).
+        if _is_delegated_child_session(pinned_row, pinned_session_id):
+            logger.warning(
+                "Async completion pinned to delegated child session %s; dropping "
+                "injection instead of waking a duplicate of the child (the child "
+                "polls its own processes).",
                 pinned_session_id,
             )
             return None
