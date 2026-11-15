@@ -427,6 +427,60 @@ def _iter_referenced_shell_scripts(
                     yield resolved
 
 
+_DATA_SCAN_MAX_BYTES = 64 * 1024 * 1024
+_SF_DATALESS = 0x40000000  # macOS: iCloud/FileProvider stub, reading would hydrate
+_LAUNCHCTL_SUBMIT_TEXT = re.compile(r"(?i)launchctl[\s\"'\\]+(?:submit|bootstrap)\b")
+
+
+def _unscannable_mention_is_clean(path: Path) -> bool:
+    """Second chance for a referenced path the bounded reader refused.
+
+    (local, 2026-11-15) Inline code gets split at `(` by the segment parser,
+    so `open('/x/jobs.json')` inside `python3 -c "..."` surfaces `/x/jobs.json`
+    in command position. A 1.1 MB jobs.json / 2 MB board ledger then exceeded
+    the 1 MiB read budget and the guard failed CLOSED: 34 of 40 sampled false
+    blocks on this install. The shell can't execute such a file (no execute
+    bit, not a shell script), so instead of refusing outright we stream-scan
+    the WHOLE file for a literal lifecycle command and only allow it if none
+    is found. Everything else keeps the original fail-closed verdict: cloud /
+    dataless stubs, executable or shell-suffixed files, FIFOs/sockets, and
+    files over 64 MiB. A small allowlist of inert devices (/dev/null...) can
+    never run a command, so it is nothing to scan.
+    """
+    try:
+        if _is_cloud_placeholder_path(path):
+            return False
+        resolved = path.resolve(strict=False)
+        if _is_cloud_placeholder_path(resolved):
+            return False
+        st = os.stat(resolved)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        # Devices, FIFOs and sockets stay fail-closed (upstream contract:
+        # test_directory_and_dev_null_fail_closed_not_crash).
+        return False
+    if getattr(st, "st_flags", 0) & _SF_DATALESS:
+        return False
+    if st.st_mode & 0o111 or resolved.suffix.lower() in {".sh", ".bash", ".zsh", ".command", ".ksh"}:
+        return False
+    if st.st_size > _DATA_SCAN_MAX_BYTES:
+        return False
+    try:
+        with open(resolved, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                # Pure-regex scan only: the token-walking submit detector is
+                # superlinear on a single huge line (a 250k-char JSON value
+                # hung it for minutes). A linear regex for the same verbs
+                # (launchctl submit|bootstrap, any spacing, any case) keeps
+                # the original fail-closed verdict for those files.
+                if contains_gateway_lifecycle_command(line) or _LAUNCHCTL_SUBMIT_TEXT.search(line):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
     for segment in _iter_command_segments(command):
@@ -568,7 +622,17 @@ def _contains_unsafe_gateway_action(
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    for payload in _iter_shell_command_payloads(command):
+    # The referenced-script and `-c` payload walks must see the same masked
+    # view the direct scan sees: a path (or `sh -c` payload) inside a provably
+    # inert heredoc body (e.g. `python3 - <<'PY'`) is never shell-executed, so
+    # walking it is a pure false positive. The stripper only masks under its
+    # conservative contract; anything ambiguous stays visible and fail-closed.
+    # (LOCAL BACKPORT of upstream 59a1403fa2, 2026-11-15)
+    from tools.shell_heredoc import strip_inert_heredoc_bodies
+
+    walk_command = strip_inert_heredoc_bodies(command)
+
+    for payload in _iter_shell_command_payloads(walk_command):
         if _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
@@ -578,7 +642,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(walk_command, cwd=cwd):
         # Do not touch a FileProvider path even to discover whether the file
         # is hydrated. The lexical check covers direct cloud paths; the
         # resolved check below covers local launchers that are symlinks into
@@ -600,6 +664,8 @@ def _contains_unsafe_gateway_action(
             continue
         visited.add(resolved)
         script_text, unsafe = _read_referenced_script(script_path)
+        if unsafe and _unscannable_mention_is_clean(script_path):
+            continue
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:

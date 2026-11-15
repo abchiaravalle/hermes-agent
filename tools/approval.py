@@ -608,9 +608,20 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
-    if malformed_grep:
+    # LOCAL BACKPORT of upstream e383c28d2f (+ local PCRE scoping, 2026-11-15).
+    # The malformed-quoting verdict needs the author's quote state.
+    # Normalization strips escapes (`\"` -> `"`), so a shell-valid pattern like
+    # `grep -o "[^\"]*"` lexed as unterminated and was reported as a hardline
+    # block. Only quoted newlines are masked: they are data, and masking keeps
+    # quoting intact.
+    _, malformed_grep = _grep_safe_detection_variant(_mask_quoted_newlines(command))
+    # A grep parse only ever HIDES text (masks pattern operands) for PCRE greps
+    # (`-P` / `--perl-regexp`); on a malformed parse nothing is hidden and every
+    # variant below still scans the full text. So the unconditional refusal is
+    # kept only where a successful parse could have masked something. Measured
+    # on this install: 60 of 60 saved hardline blocks were benign non-PCRE greps
+    # (`$(grep -c ...)` inside double quotes, `grep -o '"x"'`).
+    if malformed_grep and _GREP_PCRE_FLAG_RE.search(command):
         return (True, _MALFORMED_EXEC_DESCRIPTION)
     for command_variant in _command_detection_variants(command):
         variant_lower = command_variant.lower()
@@ -1387,6 +1398,12 @@ _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
+# A grep/egrep/zgrep invocation carrying a short-option bundle with P (-P,
+# -oP, -Pzo) or --perl-regexp in the same command segment. Over-matching only
+# keeps the conservative refusal (local, 2026-11-15).
+_GREP_PCRE_FLAG_RE = re.compile(
+    r"\b(?:e|z)?grep\b[^|;&\n)]*?\s(?:-[A-Za-z]*P|--perl-regexp)"
+)
 
 
 
@@ -2083,7 +2100,11 @@ def _iter_shell_command_starts(command: str):
                 i = nested_end if nested_end is not None else end
                 continue
             if ch in ("(", "{"):
-                starts.append(i + 1)
+                # `${` opens a parameter expansion, not a brace group: a start
+                # marked inside it would split `${IFS}` and defeat the IFS
+                # collapse in normalization (upstream e383c28d2f).
+                if not (ch == "{" and i > 0 and command[i - 1] == "$"):
+                    starts.append(i + 1)
             elif ch in ";\n":
                 starts.append(i + 1)
             elif ch in "&|":
@@ -2103,7 +2124,7 @@ def _iter_shell_command_starts(command: str):
             yield start
 
 
-def _mark_command_starts(command: str) -> str:
+def _mark_command_starts(command: str, marker: str = "\n") -> str:
     """Insert a newline before each real (quote-aware) command start.
 
     ``\\n`` is already a ``_CMDPOS`` separator, so this rewrites subshell
@@ -2125,7 +2146,7 @@ def _mark_command_starts(command: str) -> str:
     parts: list[str] = []
     previous = 0
     for offset in offsets:
-        parts.extend((command[previous:offset], "\n"))
+        parts.extend((command[previous:offset], marker))
         previous = offset
     parts.append(command[previous:])
     return "".join(parts)
@@ -2283,6 +2304,19 @@ def _command_detection_variants(command: str):
     if marked != grep_safe and marked not in seen:
         seen.add(marked)
         yield marked
+    # Every variant above tracks quotes on NORMALIZED text, where `\"` has
+    # already become `"`. That flips quote parity, so in
+    # `cat "f\"n.txt"; rm -rf /` the `; rm` start sat "inside" a phantom quote,
+    # no start was marked, and the hardline floor let it through. Mark starts
+    # on the RAW command (only quoted newlines masked), then normalize; the
+    # leading space keeps the marker from being eaten as a `\<newline>`
+    # continuation. (upstream e383c28d2f)
+    faithful = _normalize_command_for_detection(
+        _mark_command_starts(_mask_quoted_newlines(command), marker=" \n")
+    )
+    if faithful not in seen:
+        seen.add(faithful)
+        yield faithful
     # Shell quoting/escaping can spell a dangerous executable name in pieces
     # (for example r\m or r''m). Keep that deobfuscation scoped to command
     # words so similarly shaped arguments do not become false positives.

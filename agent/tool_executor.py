@@ -110,6 +110,10 @@ _START_ORDER_GATE_TIMEOUT_S = 120.0
 # answering an approval prompt, which self-terminates at approvals.timeout —
 # so a holder that overstays it is wedged and must not starve the batch.
 _AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
+# Tools that block on a long-running operation which supervises its own
+# liveness get no generic sequential deadline (see
+# _run_sequential_tool_execution_middleware).
+_SEQUENTIAL_DEADLINE_EXEMPT_TOOLS = frozenset({"delegate_task"})
 
 
 def _authorization_gate_lock_timeout() -> float:
@@ -793,7 +797,16 @@ def _run_sequential_tool_execution_middleware(
     ``<= 0``) owns that wait. Applying the generic tool deadline here would
     return ``tool_timeout`` while the prompt and worker stay active.
     """
-    timeout_s = _resolve_sequential_tool_timeout()
+    # delegate_task supervises its own children (heartbeats, stale monitor,
+    # delegation.child_timeout_seconds). Under the generic 420 s deadline a
+    # real batch "timed out" while its children ran on as orphans: 11 hits in
+    # one week here, 8 of them the daily board meeting. (LOCAL BACKPORT of
+    # upstream _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS, 2026-11-15)
+    timeout_s = (
+        None
+        if function_name in _SEQUENTIAL_DEADLINE_EXEMPT_TOOLS
+        else _resolve_sequential_tool_timeout()
+    )
     kwargs = {
         "function_name": function_name,
         "function_args": function_args,
